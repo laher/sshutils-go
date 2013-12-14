@@ -1,4 +1,4 @@
-gossh
-=====
+sshy
+====
 
 ssh utilities for go
