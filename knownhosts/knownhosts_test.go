@@ -1,6 +1,7 @@
 package knownhosts
 
 import (
+	"bytes"
 	"net"
 	"testing"
 )
@@ -24,7 +25,7 @@ func TestKnownHash(t *testing.T) {
 
 func XTestKnownHostsBasic(t *testing.T) {
 	//
-	khc := KnownHostsKeyChecker{hostsMap, nil, nil, true}
+	khc := KnownHostsKeyChecker{hostsMap, nil, nil, true, KnownHostsKeyAdderNoop{}, new(bytes.Buffer)}
 	host := "127.0.0.1"
 	key := []byte{0, 0, 0, 7, 1}
 	remote, err := net.ResolveIPAddr("ip4", "192.168.3.99")

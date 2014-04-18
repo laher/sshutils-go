@@ -3,24 +3,54 @@ package knownhosts
 import (
 	"bufio"
 	"bytes"
-	"code.google.com/p/go.crypto/ssh"
+	"code.google.com/p/gosshold/ssh"
 	"crypto/hmac"
 	"crypto/sha1"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strings"
+	"text/template"
 )
+
+type KnownHostsKeyAdder interface {
+	AddHost(host string, algorithm string, key []byte, verbose bool) error
+}
 
 type KnownHostsKeyChecker struct {
 	KnownHosts   map[string][]byte
 	RevokedHosts map[string][]byte
 	CAHosts      map[string][]byte
 	verbose      bool
+	KeyAdder KnownHostsKeyAdder
+	errPipe	     io.Writer
+}
+
+type KnownHostsKeyAdderNoop struct {
+}
+
+func (kan KnownHostsKeyAdderNoop) AddHost(host string, algorithm string, key []byte, verbose bool) error {
+	return errors.New("Key not found for "+host+". 'add key' not implemented yet in scp-go")
+}
+
+type KnownHostsKeyAdderPrompt struct {
+
+}
+
+func (kan KnownHostsKeyAdderPrompt) AddHost(host string, algorithm string, key []byte, verbose bool) error {
+	fmt.Printf("Key not found for host %s. Accept? [Y/n]\n", host)
+	confirm := ""
+	fmt.Scanf("%s", &confirm)
+	if confirm == "" || confirm == "y" || confirm == "Y" {
+		return AddKnownHost(host, algorithm, key, true)
+	} else {
+		return errors.New("Not adding key or connecting")
+	}
 }
 
 func checkHashedHost(knownHost string, host string) error {
@@ -71,6 +101,18 @@ func readHostFileKey(bs []byte, verbose bool) ssh.PublicKey {
 	return pk
 }
 
+func (khkc KnownHostsKeyChecker) IsRevoked(hostPKWireFormat []byte) error {
+	for k, existingKey := range khkc.RevokedHosts {
+		existingPublicKey := readHostFileKey(existingKey, khkc.verbose)
+		existingPKWireFormat := existingPublicKey.Marshal()
+		if bytes.Equal(hostPKWireFormat, existingPKWireFormat) {
+			return errors.New("Key has been revoked (as host '"+k+"')")
+		}
+	}
+	return nil
+}
+
+
 func (khkc KnownHostsKeyChecker) matchHostWithHashSupport(host string) ([]byte, error) {
 	existingKey, hostFound := khkc.KnownHosts[host]
 	if !hostFound {
@@ -90,41 +132,122 @@ func (khkc KnownHostsKeyChecker) matchHostWithHashSupport(host string) ([]byte, 
 	}
 	return nil, errors.New("Not found")
 }
-
 func (khkc KnownHostsKeyChecker) Check(addr string, remote net.Addr, algorithm string, hostKey []byte) error {
+	hostPublicKey := parseWireKey(hostKey, khkc.verbose)
+	hostPKWireFormat := hostPublicKey.Marshal()
+	err := khkc.IsRevoked(hostPKWireFormat)
+	if err != nil {
+		return err
+	}
 	remoteAddr := remote.String()
 	hostport := strings.SplitN(remoteAddr, ":", 2)
 	host := hostport[0]
 	existingKey, err := khkc.matchHostWithHashSupport(host)
 	if err != nil {
-		fmt.Printf("Key not found for host %s. Accept?\n", host)
-		return errors.New("Key not found. 'add key' not implemented yet in scp-go")
+		err = khkc.KeyAdder.AddHost(host, algorithm, hostKey, khkc.verbose)
+		if err != nil {
+			return err
+		}
+		//load again
+		existingKey, err = khkc.matchHostWithHashSupport(host)
+		if err != nil {
+			return err
+		}
 	}
-
 	existingPublicKey := readHostFileKey(existingKey, khkc.verbose)
-	hostPublicKey := parseWireKey(hostKey, khkc.verbose)
 	existingPKWireFormat := existingPublicKey.Marshal()
-	hostPKWireFormat := hostPublicKey.Marshal()
 	if bytes.Equal(hostPKWireFormat, existingPKWireFormat) {
 		if khkc.verbose {
 			fmt.Printf("OK keys match\n")
 		}
 		return nil
 	} else {
-		return errors.New("Key found but NOT matched!")
+tpl := `@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!
+Someone could be eavesdropping on you right now (man-in-the-middle attack)!
+It is also possible that a host key has just been changed.
+The fingerprint for the {{.HostKeyType}} key sent by the remote host is
+{{.HostKeyFingerprint}}.
+Please contact your system administrator.
+Add correct host key in {{.KnownHostsFile}} to get rid of this message.
+Offending {{.HostKeyType}} key in {{.KnownHostsFile}}:{{.Line}}
+  remove with: ssh-keygen -f "{{.KnownHostsFile}}" -R {{.Host}}
+{{.HostKeyType}} host key for {{.Host}} has changed and you have requested strict checking.
+`
+		t := template.Must(template.New("error").Parse(tpl))
+		r := struct {
+			HostKeyType string
+			HostKeyFingerprint string
+			KnownHostsFile string
+			Host string
+			Line int
+		} {
+			"ECDSA",
+			"XX:XX:XX:XX",
+			"/blah/file",
+			host,
+			1,
+		}
+		err := t.Execute(khkc.errPipe, r)
+		if err != nil {
+			fmt.Fprintf(khkc.errPipe, "Error generating error message: %v\n", err)
+		}
+		return errors.New("Host key verification failed")
 	}
 }
 
-func LoadKnownHosts(verbose bool) KnownHostsKeyChecker {
+func AddKnownHost(host string, algorithm string, key []byte, verbose bool) error {
+	file, err := OpenKnownHostsWriter(verbose)
+	if err != nil {
+		return err
+	}
+	keyEncoded := base64.StdEncoding.EncodeToString(key)
+	_, err = file.WriteString(fmt.Sprintf("%s %s %s\n", host, algorithm, keyEncoded))
+	if err != nil {
+		return err
+	}
+	return file.Close()
+}
+
+func OpenKnownHostsWriter(verbose bool) (*os.File, error) {
+	sshDir := filepath.Join(userHomeDir(verbose), ".ssh")
+	_, err := os.Stat(sshDir)
+	if os.IsNotExist(err) {
+		if verbose {
+			fmt.Printf("%s does not exist. Create\n", sshDir)
+		}
+		err := os.Mkdir(sshDir, 0700)
+		if err != nil {
+			fmt.Printf("Could not create %s\n", sshDir)
+			return nil, err
+		}
+	}
+	knownHostsFile := filepath.Join(sshDir, "known_hosts")
+	flags := os.O_RDWR|os.O_APPEND
+	_, err = os.Stat(knownHostsFile)
+	if os.IsNotExist(err) {
+		if verbose {
+			fmt.Printf("%s does not exist. Create\n", knownHostsFile)
+		}
+		flags = flags|os.O_CREATE
+	} else if err != nil {
+		return nil, err
+	}
+	return os.OpenFile(knownHostsFile, flags, 0600)
+}
+
+func LoadKnownHosts(verbose bool, errPipe io.Writer) KnownHostsKeyChecker {
 	knownHosts := map[string][]byte{}
 	revokedHosts := map[string][]byte{}
 	caHosts := map[string][]byte{}
-	khkc := KnownHostsKeyChecker{knownHosts, revokedHosts, caHosts, verbose}
+	khkc := KnownHostsKeyChecker{knownHosts, revokedHosts, caHosts, verbose, KnownHostsKeyAdderPrompt{}, errPipe}
 	sshDir := filepath.Join(userHomeDir(verbose), ".ssh")
 	_, err := os.Stat(sshDir)
 	if os.IsNotExist(err) {
 		fmt.Printf("%s does not exist\n", sshDir)
-		err := os.Mkdir(sshDir, 0777)
+		err := os.Mkdir(sshDir, 0700)
 		if err != nil {
 			fmt.Printf("Could not create %s\n", sshDir)
 		}
@@ -138,7 +261,7 @@ func LoadKnownHosts(verbose bool) KnownHostsKeyChecker {
 	}
 	file, err := os.Open(knownHostsFile)
 	if err != nil {
-		fmt.Printf("Could not create %s\n", knownHostsFile)
+		fmt.Printf("Could not open %s\n", knownHostsFile)
 		return khkc
 	}
 	defer file.Close()

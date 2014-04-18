@@ -1,12 +1,13 @@
 package sshconn
 
 import (
-	"code.google.com/p/go.crypto/ssh"
+	"code.google.com/p/gosshold/ssh"
 	"fmt"
 	"github.com/laher/sshutils-go/sshagent"
 	"github.com/laher/sshutils-go/keyring"
 	"github.com/laher/sshutils-go/knownhosts"
 	"github.com/laher/sshutils-go/pwauth"
+	"io"
 	"os"
 	"os/user"
 	"runtime"
@@ -31,20 +32,20 @@ func FillDefaultUsername(userName string) string {
 	return userName
 }
 
-func Connect(userName, host string, port int, idFile string, checkKnownHosts bool, verbose bool) (*ssh.Session, error) {
+func Connect(userName, host string, port int, idFile string, checkKnownHosts bool, verbose bool, errPipe io.Writer) (*ssh.Session, error) {
 	auths := []ssh.ClientAuth{}
 	userName = FillDefaultUsername(userName)
 	if idFile != "" {
 		auth, err := keyring.LoadKeyring(idFile)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error loading key file (%v)\n", err)
+			fmt.Fprintf(errPipe, "Error loading key file (%v)\n", err)
 		} else {
 			auths = append ( auths, auth)
 		}
 	} else {
 		auth, err := sshagent.AgentClientDefault()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error starting agent (%v)\n", err)
+			fmt.Fprintf(errPipe, "Error starting agent (%v)\n", err)
 		} else {
 			auths = append ( auths, auth)
 		}
@@ -56,17 +57,21 @@ func Connect(userName, host string, port int, idFile string, checkKnownHosts boo
 		Auth: auths,
 	}
 	if checkKnownHosts {
-		clientConfig.HostKeyChecker = knownhosts.LoadKnownHosts(verbose)
+		clientConfig.HostKeyChecker = knownhosts.LoadKnownHosts(verbose, errPipe)
 	}
 	target := fmt.Sprintf("%s:%d", host, port)
 	client, err := ssh.Dial("tcp", target, clientConfig)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "Failed to dial: "+err.Error())
+		if verbose {
+			fmt.Fprintln(errPipe, "Failed to dial: "+err.Error())
+		}
 		return nil, err
 	}
 	session, err := client.NewSession()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "Failed to create session: "+err.Error())
+		if verbose {
+			fmt.Fprintln(errPipe, "Failed to create session: "+err.Error())
+		}
 	}
 	return session, err
 

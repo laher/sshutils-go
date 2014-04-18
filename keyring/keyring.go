@@ -2,7 +2,7 @@ package keyring
 
 import (
 	"bufio"
-	"code.google.com/p/go.crypto/ssh"
+	"code.google.com/p/gosshold/ssh"
 	"crypto/ecdsa"
 	"crypto/rsa"
 	"github.com/howeyc/gopass"
@@ -71,10 +71,7 @@ func (k *clientKeyring) LoadIdFiles(files []string) []error {
 	for _, file := range files {
 		
 		err := k.LoadFromPEMFile(file)
-		errs = append(errs, err)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error loading file '%s': \n\t%v\n", file, err)
-		}
+		errs = append(errs, errors.New(fmt.Sprintf("Error loading file '%s': \n\t%v\n", file, err)))
 	}
 	return errs
 }
